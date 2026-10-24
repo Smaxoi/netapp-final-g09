@@ -1,0 +1,24 @@
+# 開發期間產生的伺服器日誌（要繳交的另外挑進 docs/evidence/）
+logs/
+*.log
+
+# 自我測試輸出
+result.json
+bc-selftest-*/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# 編輯器與作業系統
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
