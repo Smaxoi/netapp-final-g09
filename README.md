@@ -240,13 +240,31 @@ AI 為每位存活對手維護一個候選集合，並以**每一則 `TURN_RESUL
 
 ## 測試
 
-課程提供的協定自我測試工具共 **48 項**檢查：
+### 協定自我測試工具
+
+課程提供的 `bc_selftest.py` 共 **48 項**檢查：
 
 ```bash
 python bc_selftest.py --server "python bc.py server" --port 5600 --json result.json
 ```
 
-加上 `--skip-bots` 可略過最花時間的純 AI 對局一節。
+加上 `--skip-bots` 可略過最花時間的純 AI 對局一節（只跑 38 項）。
+
+### 對照課程參考實作
+
+課程另提供參考實作 `bc.py`（`BC-ref/0.9`），本機實測通過上述 48 項。開發期間以它當測試對象：
+
+```bash
+python <參考實作路徑>/bc.py server --port 5040 --players 3 --bots 1
+```
+
+它支援 `--bot-cmd`，可直接把本組的 AI 當 bot 啟動，作為互通測試台：
+
+```bash
+python <參考實作路徑>/bc.py server --players 2 --bots 1 --bot-cmd "python bc.py ai --host {host} --port {port} --name {name}"
+```
+
+> 參考實作僅作為測試對象與規範的釐清依據，不納入本儲存庫，本組程式自行實作。
 
 測試網路連通性：
 
@@ -264,7 +282,7 @@ Test-NetConnection 主機 -Port 5040
 
 | 日期 | 事項 | 檢核內容 |
 |---|---|---|
-| 11/10 | **檢查點一** | `client` 與 `ai` 連上參考伺服器，完成至少 3 局，繳交日誌 |
+| 11/10 | **檢查點一** | `client` 與 `ai` 連上參考伺服器，完成至少 3 局，繳交日誌<br>（當日另需上台簡報設計與規劃，5 分鐘） |
 | 12/1 | **檢查點二** | `server` 通過自我測試工具全部 48 項，並與至少一組完成互通對局 |
 | 12/15 | 登記對玩伺服器 | 繳交位址與埠號，由助教測試可否連入 |
 | 12/22 | 繳交全部成果 | 全班跨組對玩；AI 錦標賽 |
