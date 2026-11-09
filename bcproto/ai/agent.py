@@ -8,11 +8,15 @@ except ImportError:
     from wire import decode_line, encode
 
 class AIAgent:
-    def __init__(self, host: str, port: int, name: str = "G09-AI"):
+    def __init__(self, host: str, port: int, name: str = "G09-AI", team: str = "G09", quiet: bool = False):
         self.host = host
         self.port = port
         self.name = name
+        self.team = team
+        self.quiet = quiet
         self.writer: asyncio.StreamWriter | None = None
+        # C2: 紀錄server指派的player_id
+        self.player_id: str | None = None
 
     async def send_msg(self, msg: dict):
         """將 dict 封裝為 JSON Lines 並透過 TCP 發送 (使用 A1 encode)"""
@@ -22,13 +26,40 @@ class AIAgent:
         self.writer.write(raw_bytes)
         await self.writer.drain()
 
+    async def send_hello(self):
+        """C2 核心動作：發送 HELLO 握手註冊封包"""
+        hello_msg = {
+            "type": "HELLO",
+            "protocol": "BC/1.0",
+            "name": self.name,
+            "team": self.team,
+            "kind": "ai",
+        }
+        if not self.quiet:
+            print(f"[C2 握手] 發送 HELLO: name={self.name}, team={self.team}")
+        await self.send_msg(hello_msg)
+
+    async def handle_wellcome(self, msg: dict):
+        """C2 核心動作：處理伺服器回傳的 WELCOME 封包"""
+        self.player_id = msg.get("player_id")
+        protocol = msg.get("protocol")
+        if not self.quiet:
+            print(f"[C2 握手成功] 已加入大廳！分配到的 player_id: {self.player_id} (協定: {protocol})")
+
     async def dispatch(self, msg: dict):
-        """C1 的訊息分派中心：收到合法的 dict 訊息後印出（後續 C2~C7 會在此擴充）"""
+        """訊息分派中心"""
         mtype = msg.get("type")
-        print(f"[C1 接收] 收到訊息類型: {mtype} | 內容: {msg}")
+
+        if mtype == "WELCOME":
+            await self.handle_wellcome(msg)
+        elif mtype == "ERROR":
+            print(f"[伺服器錯誤] code={msg.get('code')}, message={msg.get('message')}")
+        else:
+            if not self.quiet:
+                print(f"[C1 接收] 收到未處理類型: {mtype} | 內容: {msg}")
 
     async def run(self):
-        """C1 核心：建立連線與 StreamReader 讀取迴圈"""
+        """TCP連線跟StreamReader讀取迴圈"""
         print(f"[C1] 嘗試連線至 {self.host}:{self.port} ...")
         try:
             reader, writer = await asyncio.open_connection(self.host, self.port)
@@ -39,6 +70,9 @@ class AIAgent:
             return
 
         try:
+            #C2: 連線成功後，先發送HELLO封包
+            await self.send_hello()
+
             while True:
                 line = await reader.readline()
                 if not line:
