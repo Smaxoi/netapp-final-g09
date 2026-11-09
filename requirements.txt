@@ -1,0 +1,11 @@
+# BC/1.0 執行時相依套件
+#
+# 本專案的 server / client / ai 三種身分都只使用 Python 標準程式庫
+# （asyncio、json、hashlib、secrets、argparse、subprocess…），
+# 不需要任何第三方套件。
+#
+# 規範 §5.1 要求「第三方套件必須列在 requirements.txt 並標明版本」。
+# 我們沒有第三方相依，因此本檔刻意保持為空，但必須存在——
+# §6.4-1 的前置檢查會在乾淨虛擬環境執行 `pip install -r requirements.txt`。
+#
+# 開發用的測試工具（pytest）列在 requirements-dev.txt，不屬於執行時相依。
