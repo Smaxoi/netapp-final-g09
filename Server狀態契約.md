@@ -77,6 +77,12 @@
 | `changed` | `asyncio.Event` | **A** `.set()` | B `await` | 狀態變動訊號 |
 | `game_id` | `str` | **B** | A | 本局識別碼 |
 | `manual_start` | `bool` | B（console） | B | 莊家輸入 `start` |
+| `conns` | `set` | **A** 增刪 | B | 所有連線，**含尚未完成 `HELLO` 者**；局末 B 要全部關掉（§5.3-6） |
+| `logf` | 檔案物件 | **B** | — | 本局日誌檔，由 `open_log()` 開啟（§5.6） |
+
+> 最後兩個欄位是 11/09 推骨架時補的，原本的表沒有。`conns` 是因為
+> §5.3-6 要求「一局結束後關閉該局所有連線」——連那些連上來卻從沒送
+> `HELLO` 的也要關，而那些連線不在 `players` 裡，B 讀不到。
 
 ## 4. Player 的欄位
 
@@ -307,15 +313,45 @@ class Server(NetMixin, GameMixin):
 
 ---
 
-## 11. 待決議
+## 11. 日誌：A 要呼叫，B 已經實作好
+
+規範 §5.6 要求伺服器把**每一則**收送的訊息寫進 `--log-dir` 的 JSON Lines 檔，
+一局一檔、每筆立即 flush。收送的動作都發生在協定層，所以**呼叫點在 A 這邊**，
+但函式彭明山已經寫好了，唐偉捷只要在兩個地方各加一行：
+
+```python
+# Conn.send() 裡，放在真正丟進傳送佇列之前
+self.srv.log("send", self.label(), msg)
+
+# handle_conn() 收到一行、decode_line() 成功之後
+self.log("recv", conn.label(), msg)
+
+# decode_line() 回 BAD_JSON 時——無法解析的輸入也要記
+self.log_raw("recv", conn.label(), text)
+```
+
+`label()` 是 A 的 `Conn` 方法，規則是：**完成 `HELLO` 後回 `player_id`，之前回
+`IP:埠號`**。這條是規範規定的 `peer` 欄位格式，不要自己改。
+
+`logf` 還沒開（大廳尚未開放）時 `log()` 會直接忽略，不會拋例外，所以不用防。
+
+---
+
+## 12. 待決議
 
 ```
-☐ 欄位名稱沿用本文（或現在改完）
+☑ 欄位名稱沿用本文           → 已推成 bcproto/server/__init__.py
+☑ 檔案切法採 mixin 三檔       → net.py（唐）／game.py（彭）／__init__.py（契約）
+☑ broadcast(msg: dict) -> None 由彭明山實作  → 已完成，含 §11.3 的對象判定
 ☐ guess_open / feedback / reveal_wait 的雙寫規則確認
 ☐ changed.set() 紀律：每個 on_* 最後無條件呼叫
-☐ broadcast(msg: dict) -> None 由彭明山實作
-☐ 檔案切法採 mixin 三檔
+☐ 新增的 conns 與日誌呼叫點（見 §3、§11）確認
 ```
 
-決議後，彭明山先推一個 `bcproto/server/__init__.py` 的**空殼**——只有上表的欄位加
-`changed`，方法全部 `pass`。唐偉捷就能立刻開始寫 handler，不必等遊戲流程寫完。
+**骨架已經推上去了**（11/09）。`bcproto/server/net.py` 是唐偉捷的檔案，裡面每個
+`on_*` 都只有 docstring 加 `raise NotImplementedError`，docstring 就是 §9 的檢查
+順序表。把 `raise` 換成實作即可，不必等遊戲流程寫完。
+
+`bcproto/server/game.py` 目前完成 `broadcast()`、`broadcast_lobby()`、
+`wait_until()`、`close_all_conns()` 與日誌五個函式；`run_game()` 的五階段流程
+要等 A10／A11 能讓玩家真的加入才能接上。

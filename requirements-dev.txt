@@ -1,0 +1,8 @@
+# 開發與測試用，不是執行時相依（執行時相依見 requirements.txt）。
+#
+#   pip install -r requirements-dev.txt
+#   pytest -q
+#
+# 三人請統一用 pytest 跑測試：tests/ 底下同時有函式風格與
+# unittest.TestCase 風格的測試，只有 pytest 能一次收集全部。
+pytest==8.3.3
