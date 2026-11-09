@@ -1,4 +1,7 @@
 import asyncio
+import hashlib
+import random
+import secrets
 import sys
 
 # 匯入放在bcproto/wire.py的A1(encode)跟A2(decode_line)
@@ -17,6 +20,9 @@ class AIAgent:
         self.writer: asyncio.StreamWriter | None = None
         # C2: 紀錄server指派的player_id
         self.player_id: str | None = None
+        # C4: 儲存自己這局的四位數跟鹽值
+        self.secret: str = ""
+        self.salt: str = ""
 
     async def send_msg(self, msg: dict):
         """將 dict 封裝為 JSON Lines 並透過 TCP 發送 (使用 A1 encode)"""
@@ -45,9 +51,10 @@ class AIAgent:
         protocol = msg.get("protocol")
         if not self.quiet:
             print(f"[C2 握手成功] 已加入大廳！分配到的 player_id: {self.player_id} (協定: {protocol})")
-    #C3：處理PING自動回PONG
+
+    # C3：處理PING自動回PONG
     async def handle_ping(self, msg: dict):
-        """C3 核心動作：收到 PING，原封不動回覆帶相同 nonce 的 PONG"""
+        """C3:收到 PING，回覆帶相同nonce的 PONG"""
         pong_msg = {"type": "PONG"}
         if "nonce" in msg:
             pong_msg["nonce"] = msg["nonce"]
@@ -55,6 +62,34 @@ class AIAgent:
         if not self.quiet:
             print(f"[C3 心跳] 收到 PING (nonce={msg.get('nonce')}) -> 回覆 PONG")
         await self.send_msg(pong_msg)
+
+    # C4：處以GAME_START，產生secret跟salt送出commit
+    def generate_secret(self) -> str:
+        """隨機生成 4 位不重複數字"""
+        digits = list("0123456789")
+        random.shuffle(digits)
+        return "".join(digits[:4])
+
+    def calculate_commit(self, secret: str, salt: str) -> str:
+        """計算 SHA-256(secret + ":" + salt)"""
+        raw = f"{secret}:{salt}".encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()
+
+    async def handle_game_start(self, msg: dict):
+        """C4：產生 secret/salt，送出COMMIT"""
+        self.secret = self.generate_secret()
+        self.salt = secrets.token_hex(16)
+        commit_hash = self.calculate_commit(self.secret, self.salt)
+
+        if not self.quiet:
+            print(f"[C4 開局] 遊戲開始！")
+            print(
+                f"[C4 產生秘密] secret={self.secret}, salt={self.salt[:8]}...,"
+                f" commit={commit_hash[:10]}..."
+            )
+
+        commit_msg = {"type": "COMMIT", "commit": commit_hash}
+        await self.send_msg(commit_msg)
 
     async def dispatch(self, msg: dict):
         """訊息分派中心"""
@@ -64,6 +99,8 @@ class AIAgent:
             await self.handle_wellcome(msg)
         elif mtype == "PING":
             await self.handle_ping(msg)
+        elif mtype == "GAME_START":
+            await self.handle_game_start(msg)
         elif mtype == "ERROR":
             print(f"[伺服器錯誤] code={msg.get('code')}, message={msg.get('message')}")
         else:
@@ -109,33 +146,3 @@ class AIAgent:
 
 
 
-# ---------------- C3 驗收測試 ----------------
-async def mock_server(reader, writer):
-    # 1. 接收 HELLO 並回傳 WELCOME
-    line = await reader.readline()
-    print(f"[Mock Server 收到]: {line.decode().strip()}")
-    writer.write(b'{"type": "WELCOME", "protocol": "BC/1.0", "player_id": "p-test-01"}\n')
-    await writer.drain()
-
-    # 2. 伺服器送出心跳 PING (帶有隨機 nonce)
-    await asyncio.sleep(0.5)
-    print("[Mock Server] 發送 PING (nonce=test_nonce_999)")
-    writer.write(b'{"type": "PING", "nonce": "test_nonce_999"}\n')
-    await writer.drain()
-
-    # 3. 接收 Client 回傳的 PONG
-    pong_line = await reader.readline()
-    print(f"[Mock Server 收到心跳回覆]: {pong_line.decode().strip()}")
-
-    await asyncio.sleep(0.5)
-    writer.close()
-    await writer.wait_closed()
-
-async def main():
-    server = await asyncio.start_server(mock_server, "127.0.0.1", 8888)
-    async with server:
-        agent = AIAgent("127.0.0.1", 8888, name="G09-AI")
-        await agent.run()
-
-if __name__ == "__main__":
-    asyncio.run(main())
