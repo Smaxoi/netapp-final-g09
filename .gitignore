@@ -31,3 +31,6 @@ env/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# 交接說明，內部文件
+CLAUDE.md

@@ -9,15 +9,21 @@
 * **B16** `log()` / `log_raw()` / `open_log()` / `close_log()`——§5.6 的
   JSON Lines 日誌，一局一檔，每筆立即 flush。
 
-`run_game()` 的階段流程（B10–B15）要等協定層的 A10／A11 能讓玩家真的加入
-才能接上，先留介面。
+* **B10–B15** `run_game()` 的五階段流程：大廳、承諾、回合循環、一致性檢查、
+  淘汰與終局揭示、名次。
+
+階段之間用 `self.phase` 交棒。協定層的 `check_message()` 讀的就是這個欄位，
+所以換階段等於同時換掉「現在接受哪些訊息」——這是兩層之間唯一的約定。
 """
 
 import asyncio
 import json
 import os
+import random
 import time
 import uuid
+
+from ..rules import compute_ranking, filter_candidates, verify_reveal
 
 #: `LOBBY.min_players` 固定為 2（§11.2）；`max_players` 才是 `--players`。
 MIN_PLAYERS = 2
@@ -172,9 +178,346 @@ class GameMixin:
             self.logf = None
 
     # ==================================================================
-    # B10–B15：階段流程。等 A10／A11 能讓玩家加入後接上。
+    # 小工具：誰還在、誰走了
+    # ==================================================================
+
+    def joined_players(self) -> list:
+        """本局仍算數的玩家（承諾階段被移出的不算）。"""
+        return [p for p in self.players.values() if p.joined]
+
+    def alive_ids(self, order: list) -> list:
+        """依輪轉順序排列的存活者 `pid`。`TURN.alive` 要的就是這個。"""
+        return [pid for pid in order if self.players[pid].status == "ALIVE"]
+
+    def gone(self, pid: str) -> bool:
+        """連線已斷——等他回應沒有意義，條件要提早放行。"""
+        conn = self.players[pid].conn
+        return conn is None or conn.closed
+
+    def depart(self, player, status: str) -> None:
+        """讓一位玩家離場，記下離場回合。
+
+        `out_turn` 必須有值，否則 §11.3 的 `GAME_OVER` 檢查會擋下來——
+        只有 `SURVIVOR` 的 `out_turn` 可以是 null。
+        """
+        player.status = status
+        if player.out_turn is None:
+            player.out_turn = self.turn_id
+
+    # ==================================================================
+    # B10：LOBBY
+    # ==================================================================
+
+    async def lobby_phase(self) -> bool:
+        """等人到齊。回傳 False 表示人數不足以開局。
+
+        離開條件有兩個（§11.2、§5.3）：人數達 `--players` 自動開局，或莊家在
+        主控台輸入 `start` 且至少 2 人。這裡無限等待，不設時限——大廳本來就
+        沒有時限，而 `wait_until(cond, None)` 正好表達這件事。
+        """
+        self.phase = "LOBBY"
+        self.broadcast_lobby()
+
+        def ready():
+            joined = len(self.joined_players())
+            return joined >= self.a.players or (self.manual_start and joined >= MIN_PLAYERS)
+
+        await self.wait_until(ready, None)
+        return len(self.joined_players()) >= MIN_PLAYERS
+
+    # ==================================================================
+    # B11：COMMIT
+    # ==================================================================
+
+    async def commit_phase(self) -> list | None:
+        """送 `GAME_START`、等承諾、移出未承諾者、送 `COMMITS`。
+
+        回傳輪轉順序；人數不足以繼續時回傳 None（由 `run_game` 發 `ABORTED`）。
+
+        輪轉順序**隨機**決定，不能用加入順序——先連進來的人若總是先喊數，
+        就等於多拿一次資訊優勢。`GAME_START.players` 的排列必須與 `order`
+        一致（§11.2 會檢查），所以兩者一起產生。
+        """
+        self.phase = "COMMIT"
+        players = self.joined_players()
+        for p in players:
+            p.status = "ALIVE"          # 協定層要 ALIVE 才收 COMMIT
+        random.shuffle(players)
+
+        self.broadcast({
+            "type": "GAME_START",
+            "game_id": self.game_id,
+            "players": [{"id": p.pid, "name": p.name, "team": p.team, "kind": p.kind}
+                        for p in players],
+            "order": [p.pid for p in players],
+            "rules": {
+                "guess_timeout": self.a.guess_timeout,
+                "feedback_timeout": self.a.feedback_timeout,
+                "commit_timeout": self.a.commit_timeout,
+                "reveal_timeout": self.a.reveal_timeout,
+                "max_turns": self.a.max_turns,
+                "max_skips": self.a.max_skips,
+            },
+        })
+
+        # 斷線的人不會再送承諾，把他們也當成「已定案」，否則整局會白等
+        # commit_timeout 秒。
+        def settled():
+            return all(p.commit is not None or self.gone(p.pid) for p in players)
+
+        await self.wait_until(settled, self.a.commit_timeout)
+
+        for p in players:
+            if p.commit is None:
+                p.status = "REMOVED"    # 移出本局，之後連廣播都收不到
+
+        order = [p.pid for p in players if p.status == "ALIVE"]
+        if len(order) < MIN_PLAYERS:
+            return None
+
+        self.broadcast({
+            "type": "COMMITS",
+            "order": order,
+            "commits": {pid: self.players[pid].commit for pid in order},
+        })
+        return order
+
+    # ==================================================================
+    # B12：回合循環（§12.3）
+    # ==================================================================
+
+    async def play_phase(self, order: list) -> str:
+        """跑回合直到剩下一人或回合數用盡，回傳 `GAME_OVER.reason`。"""
+        self.phase = "PLAY"
+        pos = 0
+
+        while True:
+            alive = self.alive_ids(order)
+            if len(alive) <= 1:
+                return "LAST_PLAYER"
+            if self.turn_id >= self.a.max_turns:
+                return "MAX_TURNS"
+
+            while self.players[order[pos % len(order)]].status != "ALIVE":
+                pos += 1
+            guesser = order[pos % len(order)]
+            pos += 1
+
+            self.turn_id += 1
+            await self.run_turn(guesser, alive)
+
+    async def run_turn(self, guesser: str, alive: list) -> None:
+        """一個回合：`TURN` → 等 `GUESS` → `GUESS_MADE` → 等 `FEEDBACK`
+        → 一致性檢查 → `TURN_RESULT` → 淘汰揭示。
+        """
+        guess = await self.collect_guess(guesser, alive)
+        if guess is None:
+            self.announce_skip(guesser)
+            return
+
+        responders = [pid for pid in alive if pid != guesser]
+        await self.collect_feedback(guesser, guess, responders)
+        eliminated, forfeited, disqualified = self.settle_turn(guess, responders)
+
+        self.broadcast({
+            "type": "TURN_RESULT",
+            "turn_id": self.turn_id,
+            "guesser": guesser,
+            "guess": guess,
+            "skipped": False,
+            "results": [{"player": pid, "a": a, "b": b}
+                        for pid, (a, b) in self.feedback.items()],
+            "eliminated": eliminated,
+            "forfeited": forfeited,
+            "disqualified": disqualified,
+        })
+
+        if eliminated:
+            await self.collect_reveals([self.players[pid] for pid in eliminated], "ELIMINATED")
+
+    async def collect_guess(self, guesser: str, alive: list) -> str | None:
+        """開喊數窗，等 `GUESS`。逾時或斷線回傳 None。"""
+        self.guesser = guesser
+        self.cur_guess = None
+        self.guess_open = True
+        self.broadcast({"type": "TURN", "turn_id": self.turn_id,
+                        "guesser": guesser, "alive": alive})
+
+        await self.wait_until(lambda: not self.guess_open or self.gone(guesser),
+                              self.a.guess_timeout)
+        self.guess_open = False
+        return self.cur_guess
+
+    def announce_skip(self, guesser: str) -> None:
+        """沒喊數的回合。連續未喊達 `--max-skips` 即判棄權（§12.3）。
+
+        `skipped` 與 `guess is None` 必須同真同假，而且 `results` 一定是空的
+        ——§11.3 會檢查這兩件事。
+        """
+        player = self.players[guesser]
+        player.skips += 1
+        forfeited = []
+        if player.skips >= self.a.max_skips or self.gone(guesser):
+            self.depart(player, "FORFEIT")
+            forfeited.append(guesser)
+
+        self.broadcast({
+            "type": "TURN_RESULT",
+            "turn_id": self.turn_id,
+            "guesser": guesser,
+            "guess": None,
+            "skipped": True,
+            "results": [],
+            "eliminated": [],
+            "forfeited": forfeited,
+            "disqualified": [],
+        })
+
+    async def collect_feedback(self, guesser: str, guess: str, responders: list) -> None:
+        """開回報窗，等所有回報者送出 `FEEDBACK`。
+
+        **收齊之前一則都不公開**（§3、§14）。先洩漏任何一筆，後面的人就能
+        據此反推並編造自己的回報，三道防線的第一道就破了。所以這裡只負責
+        等，公開一律留給 `TURN_RESULT`。
+        """
+        self.players[guesser].skips = 0
+        self.responders = responders
+        self.feedback = {}
+        self.fb_open = True
+        self.broadcast({"type": "GUESS_MADE", "turn_id": self.turn_id,
+                        "guesser": guesser, "guess": guess, "responders": responders})
+
+        await self.wait_until(
+            lambda: all(pid in self.feedback or self.gone(pid) for pid in responders),
+            self.a.feedback_timeout)
+        self.fb_open = False
+
+    # ==================================================================
+    # B13：每回合的公開一致性檢查（第一道防線）
+    # ==================================================================
+
+    def settle_turn(self, guess: str, responders: list) -> tuple:
+        """用本回合的回報刪減候選集合，決定誰離場。
+
+        對每位回報者維護「與他全部歷史回報都相容」的候選集合，從 5040 個開始
+        逐回合刪減。**集合變成空集，表示沒有任何秘密數字能同時滿足他講過的
+        每一句話**——那是數學上的矛盾，不是運氣問題，所以當回合取消資格。
+
+        回報 4A0B 表示被猜中；沒回報的則依 §12.3 判棄權。
+        """
+        eliminated, forfeited, disqualified = [], [], []
+
+        for pid in responders:
+            player = self.players[pid]
+            if pid not in self.feedback:
+                self.depart(player, "FORFEIT")
+                forfeited.append(pid)
+                continue
+
+            a, b = self.feedback[pid]
+            player.records.append((self.turn_id, guess, a, b))
+            player.cands = filter_candidates(player.cands, guess, a, b)
+
+            if not player.cands:
+                self.depart(player, "DQ")
+                disqualified.append(pid)
+            elif (a, b) == (4, 0):
+                self.depart(player, "GUESSED")
+                eliminated.append(pid)
+
+        return eliminated, forfeited, disqualified
+
+    # ==================================================================
+    # B14／B15：揭示（第二、三道防線）
+    # ==================================================================
+
+    async def collect_reveals(self, players: list, reason: str) -> None:
+        """向指定玩家要揭示，驗證後廣播 `REVEALED`。
+
+        `REVEAL_REQUEST` **只送給當事人**，不廣播。驗證結果才公開。
+
+        驗證不通過一律取消資格：沒揭示是 `NO_REVEAL`、秘密與承諾值對不上是
+        `BAD_COMMIT`、歷史回報重算不符是 `INCONSISTENT`（並附上出錯的回合）。
+        """
+        self.reveal_wait = {p.pid for p in players}
+        for p in players:
+            if p.conn is not None and not p.conn.closed:
+                p.conn.send({"type": "REVEAL_REQUEST", "reason": reason})
+
+        await self.wait_until(lambda: not self.reveal_wait, self.a.reveal_timeout)
+        self.reveal_wait = set()
+
+        for p in players:
+            secret, salt = p.reveal if p.reveal is not None else (None, None)
+            verdict, bad_turns = verify_reveal(p.commit, p.records, secret, salt)
+            if verdict != "OK":
+                self.depart(p, "DQ")
+            self.broadcast({
+                "type": "REVEALED",
+                "player": p.pid,
+                "secret": secret,
+                "salt": salt,
+                "verdict": verdict,
+                "bad_turns": bad_turns,
+            })
+
+    async def end_phase(self) -> None:
+        """終局揭示：仍存活者也要驗，通過才算 `SURVIVOR`（§14）。"""
+        self.phase = "END"
+        survivors = [p for p in self.players.values() if p.status == "ALIVE"]
+        if survivors:
+            await self.collect_reveals(survivors, "GAME_END")
+        for p in survivors:
+            if p.status == "ALIVE":
+                p.status = "SURVIVOR"
+
+    # ==================================================================
+    # 終局訊息
+    # ==================================================================
+
+    def broadcast_game_over(self, reason: str) -> None:
+        """名次由 `compute_ranking()` 算（§14.3 的標準競賽排名）。"""
+        rows = compute_ranking([(p.pid, p.status, p.out_turn) for p in self.joined_players()])
+        self.broadcast({
+            "type": "GAME_OVER",
+            "game_id": self.game_id,
+            "reason": reason,
+            "turns": self.turn_id,
+            "ranking": [{"player": pid, "status": status, "out_turn": out_turn, "rank": rank}
+                        for pid, status, out_turn, rank in rows],
+        })
+
+    def broadcast_aborted(self) -> None:
+        """人數不足以開局或繼續。`turns` 與 `ranking` 必須是 0 與空陣列（§11.3）。"""
+        self.broadcast({"type": "GAME_OVER", "game_id": self.game_id,
+                        "reason": "ABORTED", "turns": 0, "ranking": []})
+
+    # ==================================================================
+    # B10–B15：主流程
     # ==================================================================
 
     async def run_game(self) -> None:
-        """主持一局：LOBBY → COMMIT → PLAY → END → OVER。"""
-        raise NotImplementedError("B10–B15 尚未實作（彭明山；需 A10／A11）")
+        """主持一局：LOBBY → COMMIT → PLAY → END → OVER。
+
+        `finally` 裡的三件事不論中途怎麼結束都要做：標記 `OVER`（協定層看到
+        就不再收任何訊息）、關閉本局所有連線（§5.3-6，含從未送 `HELLO` 的）、
+        關掉日誌檔。
+        """
+        self.game_id = self.new_game_id()
+        self.open_log(self.game_id)
+        try:
+            if not await self.lobby_phase():
+                self.broadcast_aborted()
+                return
+            order = await self.commit_phase()
+            if order is None:
+                self.broadcast_aborted()
+                return
+            reason = await self.play_phase(order)
+            await self.end_phase()
+            self.broadcast_game_over(reason)
+        finally:
+            self.phase = "OVER"
+            self.games_played += 1
+            self.close_all_conns()
+            self.close_log()

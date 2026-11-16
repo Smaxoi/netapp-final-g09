@@ -20,7 +20,8 @@ import asyncio
 
 from ..rules import ALL_NUMBERS
 from .game import GameMixin
-from .net import NetMixin
+from .checks import check_message
+from .net import Conn, NetMixin
 
 #: 一條連線累積超過 20 次錯誤，第 21 次要先送該錯誤再送致命的
 #: `TOO_MANY_ERRORS`（§13）。放在這裡是因為 A 與 B 都可能需要讀它。
@@ -140,4 +141,5 @@ class Server(NetMixin, GameMixin):
         self.games_played = 0
 
 
-__all__ = ["Server", "Player", "MAX_ERRORS", "MAX_OUTQUEUE", "HELLO_TIMEOUT"]
+__all__ = ["Server", "Player", "Conn", "check_message",
+           "MAX_ERRORS", "MAX_OUTQUEUE", "HELLO_TIMEOUT"]
