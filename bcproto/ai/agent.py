@@ -8,9 +8,11 @@ import sys
 try:
     from bcproto.wire import decode_line, encode
     from bcproto.ai.stratagy import choose_guess
+    from bcproto.rules import score
 except ImportError:
     from wire import decode_line, encode
     from stratagy import choose_guess
+    from rules import score
 
 class AIAgent:
     def __init__(self, host: str, port: int, name: str = "G09-AI", team: str = "G09", quiet: bool = False):
@@ -25,6 +27,7 @@ class AIAgent:
         # C4: 儲存自己這局的四位數跟鹽值
         self.secret: str = ""
         self.salt: str = ""
+        self.feedback_turns: set[int] = set()
 
     async def send_msg(self, msg: dict):
         """將 dict 封裝為 JSON Lines 並透過 TCP 發送 (使用 A1 encode)"""
@@ -79,6 +82,7 @@ class AIAgent:
 
     async def handle_game_start(self, msg: dict):
         """C4：產生 secret/salt，送出COMMIT"""
+        self.feedback_turns.clear()
         self.secret = self.generate_secret()
         self.salt = secrets.token_hex(16)
         commit_hash = self.calculate_commit(self.secret, self.salt)
@@ -106,6 +110,24 @@ class AIAgent:
             print(f"[C5 喊數] 輪到自己 (turn_id={turn_id}) -> GUESS {value}")
         await self.send_msg(guess_msg)
 
+    async def handle_guess_made(self, msg: dict):
+        """自己是回報者時，計算秘密數字的 (A, B) 並回傳 FEEDBACK。"""
+        if self.player_id not in msg.get("responders", []):
+            return
+
+        turn_id = msg.get("turn_id")
+        if turn_id in self.feedback_turns:
+            return
+
+        guess_value = msg.get("guess")
+        a, b = score(guess_value, self.secret)
+        self.feedback_turns.add(turn_id)
+        feedback_msg = {"type": "FEEDBACK", "turn_id": turn_id, "a": a, "b": b}
+
+        if not self.quiet:
+            print(f"[C5 回報] turn_id={turn_id} guess={guess_value} -> {a}A{b}B")
+        await self.send_msg(feedback_msg)
+
     async def dispatch(self, msg: dict):
         """訊息分派中心"""
         mtype = msg.get("type")
@@ -118,6 +140,8 @@ class AIAgent:
             await self.handle_game_start(msg)
         elif mtype == "TURN":
             await self.handle_turn(msg)
+        elif mtype == "GUESS_MADE":
+            await self.handle_guess_made(msg)
         elif mtype == "ERROR":
             print(f"[伺服器錯誤] code={msg.get('code')}, message={msg.get('message')}")
         else:
