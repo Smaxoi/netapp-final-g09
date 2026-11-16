@@ -28,6 +28,7 @@ class AIAgent:
         self.secret: str = ""
         self.salt: str = ""
         self.feedback_turns: set[int] = set()
+        self.reveal_sent = False
 
     async def send_msg(self, msg: dict):
         """將 dict 封裝為 JSON Lines 並透過 TCP 發送 (使用 A1 encode)"""
@@ -83,6 +84,7 @@ class AIAgent:
     async def handle_game_start(self, msg: dict):
         """C4：產生 secret/salt，送出COMMIT"""
         self.feedback_turns.clear()
+        self.reveal_sent = False
         self.secret = self.generate_secret()
         self.salt = secrets.token_hex(16)
         commit_hash = self.calculate_commit(self.secret, self.salt)
@@ -128,6 +130,18 @@ class AIAgent:
             print(f"[C5 回報] turn_id={turn_id} guess={guess_value} -> {a}A{b}B")
         await self.send_msg(feedback_msg)
 
+    async def handle_reveal_request(self, msg: dict):
+        """收到揭示要求時，自動送出本局的秘密與鹽值。"""
+        if self.reveal_sent or not self.secret or not self.salt:
+            return
+
+        self.reveal_sent = True
+        reveal_msg = {"type": "REVEAL", "secret": self.secret, "salt": self.salt}
+
+        if not self.quiet:
+            print(f"[C6 揭示] 收到 REVEAL_REQUEST ({msg.get('reason')}) -> 送出秘密")
+        await self.send_msg(reveal_msg)
+
     async def dispatch(self, msg: dict):
         """訊息分派中心"""
         mtype = msg.get("type")
@@ -142,6 +156,8 @@ class AIAgent:
             await self.handle_turn(msg)
         elif mtype == "GUESS_MADE":
             await self.handle_guess_made(msg)
+        elif mtype == "REVEAL_REQUEST":
+            await self.handle_reveal_request(msg)
         elif mtype == "ERROR":
             print(f"[伺服器錯誤] code={msg.get('code')}, message={msg.get('message')}")
         else:
@@ -186,6 +202,5 @@ class AIAgent:
             writer.close()
             await writer.wait_closed()
             print("[C1] 連線已安全關閉")
-
 
 
