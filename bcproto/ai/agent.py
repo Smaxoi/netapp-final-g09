@@ -8,11 +8,11 @@ import sys
 try:
     from bcproto.wire import decode_line, encode
     from bcproto.ai.stratagy import choose_guess
-    from bcproto.rules import score
+    from bcproto.rules import ALL_NUMBERS, filter_candidates, score
 except ImportError:
     from wire import decode_line, encode
     from stratagy import choose_guess
-    from rules import score
+    from rules import ALL_NUMBERS, filter_candidates, score
 
 class AIAgent:
     def __init__(self, host: str, port: int, name: str = "G09-AI", team: str = "G09", quiet: bool = False):
@@ -29,6 +29,7 @@ class AIAgent:
         self.salt: str = ""
         self.feedback_turns: set[int] = set()
         self.reveal_sent = False
+        self.candidates: dict[str, list[str]] = {}
 
     async def send_msg(self, msg: dict):
         """將 dict 封裝為 JSON Lines 並透過 TCP 發送 (使用 A1 encode)"""
@@ -85,6 +86,17 @@ class AIAgent:
         """C4：產生 secret/salt，送出COMMIT"""
         self.feedback_turns.clear()
         self.reveal_sent = False
+        # 正式協定的 players 是 {"id": ...} 物件；舊版 mock server
+        # 可能只傳 player_id 字串，兩種格式都接受。
+        player_ids = [
+            player["id"] if isinstance(player, dict) else player
+            for player in msg.get("players", [])
+        ]
+        self.candidates = {
+            player_id: list(ALL_NUMBERS)
+            for player_id in player_ids
+            if player_id != self.player_id
+        }
         self.secret = self.generate_secret()
         self.salt = secrets.token_hex(16)
         commit_hash = self.calculate_commit(self.secret, self.salt)
@@ -142,6 +154,31 @@ class AIAgent:
             print(f"[C6 揭示] 收到 REVEAL_REQUEST ({msg.get('reason')}) -> 送出秘密")
         await self.send_msg(reveal_msg)
 
+    async def handle_turn_result(self, msg: dict):
+        """用每一則 TURN_RESULT 的回報更新所有對手候選集合。"""
+        guess_value = msg.get("guess")
+        if guess_value is None:
+            return
+
+        for result in msg.get("results", []):
+            # 正式協定欄位是 player；舊版 mock server 曾使用 player_id。
+            player_id = result.get("player", result.get("player_id"))
+            if player_id not in self.candidates:
+                continue
+            self.candidates[player_id] = filter_candidates(
+                self.candidates[player_id],
+                guess_value,
+                result["a"],
+                result["b"],
+            )
+
+        if not self.quiet:
+            sizes = ", ".join(
+                f"{player_id}={len(cands)}"
+                for player_id, cands in self.candidates.items()
+            )
+            print(f"[C5 推理] turn_id={msg.get('turn_id')} 候選數: {sizes}")
+
     async def dispatch(self, msg: dict):
         """訊息分派中心"""
         mtype = msg.get("type")
@@ -158,6 +195,8 @@ class AIAgent:
             await self.handle_guess_made(msg)
         elif mtype == "REVEAL_REQUEST":
             await self.handle_reveal_request(msg)
+        elif mtype == "TURN_RESULT":
+            await self.handle_turn_result(msg)
         elif mtype == "ERROR":
             print(f"[伺服器錯誤] code={msg.get('code')}, message={msg.get('message')}")
         else:
@@ -204,3 +243,98 @@ class AIAgent:
             print("[C1] 連線已安全關閉")
 
 
+
+# ---------------- TURN_RESULT 獨立驗收測試 ----------------
+def _score_pair(guess: str, secret: str) -> tuple[int, int]:
+    """測試腳本內建標準算分器"""
+    a = sum(1 for g, s in zip(guess, secret) if g == s)
+    b = sum(1 for g in guess if g in secret) - a
+    return a, b
+
+async def mock_server(reader, writer):
+    # 1. [C2] 握手發放 ID: p-test-01
+    await reader.readline()
+    writer.write(b'{"type": "WELCOME", "protocol": "BC/1.0", "player_id": "p-test-01"}\n')
+    await writer.drain()
+
+    # 2. [C4] 廣播開局（3位玩家：自己 + 2位對手），AI 應該要為 2 位對手各初始化 5040 個候選數
+    await asyncio.sleep(0.2)
+    print("\n[Mock Server] 廣播 GAME_START (玩家: p-test-01, p-other-02, p-other-03)...")
+    writer.write(b'{"type": "GAME_START", "players": ["p-test-01", "p-other-02", "p-other-03"]}\n')
+    await writer.drain()
+    await reader.readline()  # 讀掉 COMMIT
+
+    # 3. 模擬第 1 輪結算 (TURN_RESULT)：你猜了 "1234"
+    # 假設 p-other-02 的秘密是 "1289" -> 回報 2A0B
+    # 假設 p-other-03 的秘密是 "5678" -> 回報 0A0B
+    await asyncio.sleep(0.3)
+    print("[Mock Server] 廣播第 1 輪 TURN_RESULT：p-test-01 猜 '1234' (p-other-02: 2A0B, p-other-03: 0A0B)")
+    turn1_msg = (
+        b'{"type": "TURN_RESULT", "turn_id": 1, "guesser": "p-test-01", "guess": "1234", '
+        b'"results": ['
+        b'{"player_id": "p-other-02", "a": 2, "b": 0}, '
+        b'{"player_id": "p-other-03", "a": 0, "b": 0}'
+        b']}\n'
+    )
+    writer.write(turn1_msg)
+    await writer.drain()
+
+    # 4. 模擬第 2 輪結算 (TURN_RESULT)：p-other-02 猜了 "1289"
+    # p-test-01 (你自己) 也回報了，但 AI 不應該把自己當對手建立候選集
+    # p-other-03 回報 0A2B (假設秘密 "5678" 對上 "1289" -> 8在位置3對1個? 不對，測試純看過濾邏輯)
+    await asyncio.sleep(0.3)
+    print("[Mock Server] 廣播第 2 輪 TURN_RESULT：p-other-02 猜 '1289' (p-test-01: 1A1B, p-other-03: 0A1B)")
+    turn2_msg = (
+        b'{"type": "TURN_RESULT", "turn_id": 2, "guesser": "p-other-02", "guess": "1289", '
+        b'"results": ['
+        b'{"player_id": "p-test-01", "a": 1, "b": 1}, '
+        b'{"player_id": "p-other-03", "a": 0, "b": 1}'
+        b']}\n'
+    )
+    writer.write(turn2_msg)
+    await writer.drain()
+
+    await asyncio.sleep(0.3)
+
+    # 5. 驗收你的 AI 內部候選集合狀態（預設名稱為 agent_instance.candidates，若你取別的名字可自行調整）
+    candidates_map = getattr(agent_instance, "candidates", None)
+    if not isinstance(candidates_map, dict):
+        print("[驗收失敗] 找不到 dict 型態的 self.candidates 屬性！")
+    else:
+        print(f"\n[驗收檢查] 目前追蹤的對手清單: {list(candidates_map.keys())}")
+        
+        # 檢查 A：不能把自己放進對手候選集
+        has_self = "p-test-01" in candidates_map
+        
+        # 檢查 B：計算標準過濾後的剩餘數量
+        all_nums = [f"{a}{b}{c}{d}" for a in "0123456789" for b in "0123456789" for c in "0123456789" for d in "0123456789" if len({a,b,c,d}) == 4]
+        exp_p2 = [n for n in all_nums if _score_pair("1234", n) == (2, 0)]
+        exp_p3 = [n for n in all_nums if _score_pair("1234", n) == (0, 0) and _score_pair("1289", n) == (0, 1)]
+
+        actual_p2 = candidates_map.get("p-other-02", [])
+        actual_p3 = candidates_map.get("p-other-03", [])
+
+        if (not has_self and 
+            len(actual_p2) == len(exp_p2) and set(actual_p2) == set(exp_p2) and
+            len(actual_p3) == len(exp_p3) and set(actual_p3) == set(exp_p3)):
+            print(f"[驗收通過] 完美！已排除自己，且 p-other-02 剩餘 {len(actual_p2)} 組、p-other-03 剩餘 {len(actual_p3)} 組候選數，與標準答案 100% 吻合！")
+        else:
+            print(f"[驗收失敗] 候選集合數量或內容不符！")
+            print(f"  - 是否誤把自己加入對手: {has_self}")
+            print(f"  - p-other-02 預期 {len(exp_p2)} 組，實際 {len(actual_p2)} 組")
+            print(f"  - p-other-03 預期 {len(exp_p3)} 組，實際 {len(actual_p3)} 組")
+
+    writer.close()
+    await writer.wait_closed()
+
+agent_instance: AIAgent
+
+async def main():
+    global agent_instance
+    server = await asyncio.start_server(mock_server, "127.0.0.1", 8888)
+    async with server:
+        agent_instance = AIAgent("127.0.0.1", 8888, name="G09-AI")
+        await agent_instance.run()
+
+if __name__ == "__main__":
+    asyncio.run(main())
