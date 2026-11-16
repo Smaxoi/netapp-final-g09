@@ -7,8 +7,10 @@ import sys
 # 匯入放在bcproto/wire.py的A1(encode)跟A2(decode_line)
 try:
     from bcproto.wire import decode_line, encode
+    from bcproto.ai.stratagy import choose_guess
 except ImportError:
     from wire import decode_line, encode
+    from stratagy import choose_guess
 
 class AIAgent:
     def __init__(self, host: str, port: int, name: str = "G09-AI", team: str = "G09", quiet: bool = False):
@@ -91,6 +93,19 @@ class AIAgent:
         commit_msg = {"type": "COMMIT", "commit": commit_hash}
         await self.send_msg(commit_msg)
 
+    async def handle_turn(self, msg: dict):
+        """輪到自己時，回覆同一回合的 GUESS。"""
+        if msg.get("guesser") != self.player_id:
+            return
+
+        turn_id = msg.get("turn_id")
+        value = choose_guess()
+        guess_msg = {"type": "GUESS", "turn_id": turn_id, "guess": value}
+
+        if not self.quiet:
+            print(f"[C5 喊數] 輪到自己 (turn_id={turn_id}) -> GUESS {value}")
+        await self.send_msg(guess_msg)
+
     async def dispatch(self, msg: dict):
         """訊息分派中心"""
         mtype = msg.get("type")
@@ -101,6 +116,8 @@ class AIAgent:
             await self.handle_ping(msg)
         elif mtype == "GAME_START":
             await self.handle_game_start(msg)
+        elif mtype == "TURN":
+            await self.handle_turn(msg)
         elif mtype == "ERROR":
             print(f"[伺服器錯誤] code={msg.get('code')}, message={msg.get('message')}")
         else:
