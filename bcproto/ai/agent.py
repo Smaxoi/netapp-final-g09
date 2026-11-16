@@ -111,7 +111,7 @@ class AIAgent:
         """TCP連線跟StreamReader讀取迴圈"""
         print(f"[C1] 嘗試連線至 {self.host}:{self.port} ...")
         try:
-            reader, writer = await asyncio.open_connection(self.host, self.port)
+            reader, writer = await asyncio.open_connection(self.host, self.port, limit=4095,)
             self.writer = writer
             print(f"[C1] 連線成功！進入封包監聽迴圈...")
         except Exception as e:
@@ -139,6 +139,8 @@ class AIAgent:
                 await self.dispatch(msg)
         except asyncio.CancelledError:
             pass
+        except ValueError as e:
+            print(f"[C1 警告] 收到超長訊息，連線關閉：{e}")
         finally:
             writer.close()
             await writer.wait_closed()
