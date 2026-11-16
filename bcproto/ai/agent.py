@@ -68,9 +68,9 @@ class AIAgent:
     # C4：處以GAME_START，產生secret跟salt送出commit
     def generate_secret(self) -> str:
         """隨機生成 4 位不重複數字"""
-        digits = list("0123456789")
-        random.shuffle(digits)
-        return "".join(digits[:4])
+        digits = "0123456789"
+        rng = secrets.SystemRandom()
+        return "".join(rng.sample(digits, 4))
 
     def calculate_commit(self, secret: str, salt: str) -> str:
         """計算 SHA-256(secret + ":" + salt)"""
