@@ -117,7 +117,7 @@ class AIAgent:
             return
 
         turn_id = msg.get("turn_id")
-        value = choose_guess()
+        value = choose_guess(self.candidates)
         guess_msg = {"type": "GUESS", "turn_id": turn_id, "guess": value}
 
         if not self.quiet:
@@ -241,6 +241,7 @@ class AIAgent:
             writer.close()
             await writer.wait_closed()
             print("[C1] 連線已安全關閉")
+
 
 
 
