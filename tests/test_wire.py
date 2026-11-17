@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from bcproto.wire import MAX_LINE, decode_line, encode
+from bcproto.wire import MAX_JSON_DEPTH, MAX_LINE, decode_line, encode
 
 
 class WireTests(unittest.TestCase):
@@ -82,6 +82,43 @@ class WireTests(unittest.TestCase):
         malformed = b'{"type":"PING","extra":' + b"[" * 4000 + b"\n"
         self.assertLessEqual(len(malformed), MAX_LINE)
         self.assertEqual(decode_line(malformed), (None, "BAD_JSON"))
+
+    def test_depth_limit_includes_outer_object_and_accepts_exact_boundary(self):
+        # 外層物件為第一層，其內再放 MAX_JSON_DEPTH - 1 層陣列。
+        levels = MAX_JSON_DEPTH - 1
+        raw = b'{"type":"PING","extra":' + b"[" * levels + b"0" + b"]" * levels + b"}\n"
+        msg, error = decode_line(raw)
+        self.assertIsNone(error)
+        self.assertEqual(msg["type"], "PING")
+
+    def test_one_level_above_limit_returns_bad_json(self):
+        levels = MAX_JSON_DEPTH
+        raw = b'{"type":"PING","extra":' + b"[" * levels + b"0" + b"]" * levels + b"}\n"
+        self.assertLessEqual(len(raw), MAX_LINE)
+        self.assertEqual(decode_line(raw), (None, "BAD_JSON"))
+
+    def test_mixed_object_and_array_depth_is_limited(self):
+        nested = b"0"
+        for level in range(MAX_JSON_DEPTH):
+            nested = b'{"v":' + nested + b"}" if level % 2 else b"[" + nested + b"]"
+        raw = b'{"type":"PING","extra":' + nested + b"}\n"
+        self.assertLessEqual(len(raw), MAX_LINE)
+        self.assertEqual(decode_line(raw), (None, "BAD_JSON"))
+
+    def test_brackets_inside_strings_and_escaped_characters_do_not_count(self):
+        msg = {"type": "PING", "nonce": "[{" * MAX_JSON_DEPTH
+               + 'quoted " and slash \\' + "}]" * MAX_JSON_DEPTH}
+        self.assertEqual(decode_line(encode(msg)), (msg, None))
+
+    def test_escaped_string_cannot_hide_later_deep_container(self):
+        prefix = json.dumps({"type": "PING", "nonce": 'quote " and slash \\'},
+                            separators=(",", ":")).encode("utf-8")[:-1]
+        raw = prefix + b',"extra":' + b"[" * MAX_JSON_DEPTH + b"0" + b"]" * MAX_JSON_DEPTH + b"}\n"
+        self.assertEqual(decode_line(raw), (None, "BAD_JSON"))
+
+    def test_sibling_containers_do_not_accumulate_depth(self):
+        msg = {"type": "PING", "extra": [{"value": n} for n in range(128)]}
+        self.assertEqual(decode_line(encode(msg)), (msg, None))
 
     def test_unknown_fields_and_types_left_for_dispatch(self):
         msg = {"type": "FUTURE", "future_field": {"nested": True}}
