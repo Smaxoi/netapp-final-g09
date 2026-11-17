@@ -124,7 +124,7 @@ class AIAgent:
 
     # C5：TURN → 送 GUESS
     async def handle_turn(self, msg: dict):
-        """輪到自己時，回覆同一回合的 GUESS。"""
+        """C5/C10：輪到自己時，以 most-parts 策略送出 GUESS。"""
         if msg.get("guesser") != self.player_id:
             return
 
