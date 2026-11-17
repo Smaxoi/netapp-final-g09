@@ -6,6 +6,10 @@ import re
 
 MAX_LINE = 4096
 
+# 接收端的資源防護上限，並非協定新增欄位限制。物件與陣列各算一層，
+# 最外層物件為第一層；現有協定訊息最深只需要三層。
+MAX_JSON_DEPTH = 64
+
 def encode(msg: dict) -> bytes:
     if not isinstance(msg, dict) or not isinstance(msg.get("type"), str):
         raise ValueError("BAD_JSON")
@@ -64,8 +68,35 @@ def reject_duplicate(pairs):
     return result
 
 
+def _check_json_depth(text: str) -> None:
+    """在 loads 之前限制巢狀深度，不依賴各 Python 版本的遞迴限制。
+
+    只計算字串外的物件／陣列括號；字串內的括號、跳脫引號與反斜線不
+    影響深度。其他 JSON 語法是否正確仍由 json.loads 判定。
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in "{[":
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise ValueError("JSON nesting exceeds the depth limit")
+        elif char in "}]":
+            depth -= 1
+
+
 def decode_line(raw: bytes) -> tuple[dict | None, str | None]:
-    """解析已由連線層切出的單行；空行回 (None, None)，壞資料回 BAD_JSON。"""
+    """解析單行；空行回 (None, None)，壞資料或超過深度上限回 BAD_JSON。"""
     try:
         text = raw.decode("utf-8")
 
@@ -79,6 +110,8 @@ def decode_line(raw: bytes) -> tuple[dict | None, str | None]:
         # 空行直接忽略
         if text == "":
             return None, None
+
+        _check_json_depth(text)
 
         # JSON 字串 -> Python 物件
         msg = json.loads(
