@@ -1,18 +1,33 @@
 import asyncio
-import hashlib
 import random
 import secrets
 import sys
 
 # 匯入放在bcproto/wire.py的A1(encode)跟A2(decode_line)
 try:
-    from bcproto.wire import decode_line, encode
+    from bcproto.wire import MAX_LINE, decode_line, encode
     from bcproto.ai.stratagy import choose_guess
-    from bcproto.rules import ALL_NUMBERS, filter_candidates, score
+    from bcproto.rules import ALL_NUMBERS, filter_candidates, make_commit, score
+    from bcproto.messages import (
+        commit as build_commit,
+        feedback as build_feedback,
+        guess as build_guess,
+        hello,
+        pong as build_pong,
+        reveal as build_reveal,
+    )
 except ImportError:
-    from wire import decode_line, encode
+    from wire import MAX_LINE, decode_line, encode
     from stratagy import choose_guess
-    from rules import ALL_NUMBERS, filter_candidates, score
+    from rules import ALL_NUMBERS, filter_candidates, make_commit, score
+    from messages import (
+        commit as build_commit,
+        feedback as build_feedback,
+        guess as build_guess,
+        hello,
+        pong as build_pong,
+        reveal as build_reveal,
+    )
 
 class AIAgent:
     def __init__(self, host: str, port: int, name: str = "G09-AI", team: str = "G09", quiet: bool = False):
@@ -41,13 +56,8 @@ class AIAgent:
 
     async def send_hello(self):
         """C2 核心動作：發送 HELLO 握手註冊封包"""
-        hello_msg = {
-            "type": "HELLO",
-            "protocol": "BC/1.0",
-            "name": self.name,
-            "team": self.team,
-            "kind": "ai",
-        }
+        # 使用共用訊息建構器，確保欄位格式和協定層一致。
+        hello_msg = hello(self.name, self.team, "ai")
         if not self.quiet:
             print(f"[C2 握手] 發送 HELLO: name={self.name}, team={self.team}")
         await self.send_msg(hello_msg)
@@ -62,9 +72,11 @@ class AIAgent:
     # C3：處理PING自動回PONG
     async def handle_ping(self, msg: dict):
         """C3:收到 PING，回覆帶相同nonce的 PONG"""
-        pong_msg = {"type": "PONG"}
-        if "nonce" in msg:
-            pong_msg["nonce"] = msg["nonce"]
+        pong_msg = (
+            build_pong(msg["nonce"])
+            if "nonce" in msg
+            else build_pong()
+        )
 
         if not self.quiet:
             print(f"[C3 心跳] 收到 PING (nonce={msg.get('nonce')}) -> 回覆 PONG")
@@ -78,9 +90,8 @@ class AIAgent:
         return "".join(rng.sample(digits, 4))
 
     def calculate_commit(self, secret: str, salt: str) -> str:
-        """計算 SHA-256(secret + ":" + salt)"""
-        raw = f"{secret}:{salt}".encode("utf-8")
-        return hashlib.sha256(raw).hexdigest()
+        """B3：使用共用 make_commit() 計算承諾值。"""
+        return make_commit(secret, salt)
 
     async def handle_game_start(self, msg: dict):
         """C4：產生 secret/salt，送出COMMIT"""
@@ -108,9 +119,10 @@ class AIAgent:
                 f" commit={commit_hash[:10]}..."
             )
 
-        commit_msg = {"type": "COMMIT", "commit": commit_hash}
+        commit_msg = build_commit(commit_hash)
         await self.send_msg(commit_msg)
 
+    # C5：TURN → 送 GUESS
     async def handle_turn(self, msg: dict):
         """輪到自己時，回覆同一回合的 GUESS。"""
         if msg.get("guesser") != self.player_id:
@@ -118,12 +130,13 @@ class AIAgent:
 
         turn_id = msg.get("turn_id")
         value = choose_guess(self.candidates)
-        guess_msg = {"type": "GUESS", "turn_id": turn_id, "guess": value}
+        guess_msg = build_guess(turn_id, value)
 
         if not self.quiet:
             print(f"[C5 喊數] 輪到自己 (turn_id={turn_id}) -> GUESS {value}")
         await self.send_msg(guess_msg)
 
+    # C6：GUESS_MADE → 計算 (a, b) → 送 FEEDBACK
     async def handle_guess_made(self, msg: dict):
         """自己是回報者時，計算秘密數字的 (A, B) 並回傳 FEEDBACK。"""
         if self.player_id not in msg.get("responders", []):
@@ -136,24 +149,26 @@ class AIAgent:
         guess_value = msg.get("guess")
         a, b = score(guess_value, self.secret)
         self.feedback_turns.add(turn_id)
-        feedback_msg = {"type": "FEEDBACK", "turn_id": turn_id, "a": a, "b": b}
+        feedback_msg = build_feedback(turn_id, a, b)
 
         if not self.quiet:
-            print(f"[C5 回報] turn_id={turn_id} guess={guess_value} -> {a}A{b}B")
+            print(f"[C6 回報] turn_id={turn_id} guess={guess_value} -> {a}A{b}B")
         await self.send_msg(feedback_msg)
 
+    # C7：REVEAL_REQUEST → 自動送 REVEAL
     async def handle_reveal_request(self, msg: dict):
         """收到揭示要求時，自動送出本局的秘密與鹽值。"""
         if self.reveal_sent or not self.secret or not self.salt:
             return
 
         self.reveal_sent = True
-        reveal_msg = {"type": "REVEAL", "secret": self.secret, "salt": self.salt}
+        reveal_msg = build_reveal(self.secret, self.salt)
 
         if not self.quiet:
-            print(f"[C6 揭示] 收到 REVEAL_REQUEST ({msg.get('reason')}) -> 送出秘密")
+            print(f"[C7 揭示] 收到 REVEAL_REQUEST ({msg.get('reason')}) -> 送出秘密")
         await self.send_msg(reveal_msg)
 
+    # C8：TURN_RESULT → 用每一則更新所有對手候選集合
     async def handle_turn_result(self, msg: dict):
         """用每一則 TURN_RESULT 的回報更新所有對手候選集合。"""
         guess_value = msg.get("guess")
@@ -177,7 +192,7 @@ class AIAgent:
                 f"{player_id}={len(cands)}"
                 for player_id, cands in self.candidates.items()
             )
-            print(f"[C5 推理] turn_id={msg.get('turn_id')} 候選數: {sizes}")
+            print(f"[C8 推理] turn_id={msg.get('turn_id')} 候選數: {sizes}")
 
     async def dispatch(self, msg: dict):
         """訊息分派中心"""
@@ -204,10 +219,13 @@ class AIAgent:
                 print(f"[C1 接收] 收到未處理類型: {mtype} | 內容: {msg}")
 
     async def run(self):
-        """TCP連線跟StreamReader讀取迴圈"""
+        """C1～C9：連線、收包分派，並自動跑完一局。"""
         print(f"[C1] 嘗試連線至 {self.host}:{self.port} ...")
         try:
-            reader, writer = await asyncio.open_connection(self.host, self.port, limit=4095,)
+            # MAX_LINE 包含結尾 LF；StreamReader 的 limit 不包含分隔符，故減 1。
+            reader, writer = await asyncio.open_connection(
+                self.host, self.port, limit=MAX_LINE - 1
+            )
             self.writer = writer
             print(f"[C1] 連線成功！進入封包監聽迴圈...")
         except Exception as e:
