@@ -5,7 +5,7 @@ from __future__ import annotations
 import secrets
 
 from ..messages import commit, feedback, reveal
-from ..rules import make_commit, score
+from ..rules import make_commit, score, verify_reveal
 from ..validators import valid_feedback, valid_number
 
 
@@ -16,7 +16,13 @@ class ClientSession:
         self.secret: str | None = None
         self.salt: str | None = None
         self.commit: str | None = None
+        self.player_id: str | None = None
+        self.records: list[tuple[int, str, int, int]] = []
         self._feedback_drafts: dict[int, tuple[str, int, int]] = {}
+
+    def handle_welcome(self, msg: dict) -> None:
+        """記住 server 分配的 player_id，供本地揭示驗證使用。"""
+        self.player_id = msg.get("player_id")
 
     def set_secret(self, secret: str) -> dict:
         """設定秘密並建立 COMMIT；秘密必須是四位不重複 ASCII 數字。"""
@@ -25,6 +31,8 @@ class ClientSession:
         self.secret = secret
         self.salt = secrets.token_hex(16)
         self.commit = make_commit(secret, self.salt)
+        self.records.clear()
+        self._feedback_drafts.clear()
         return commit(self.commit)
 
     def reveal_message(self) -> dict:
@@ -67,7 +75,39 @@ class ClientSession:
         if changed and not confirmed:
             raise ValueError("修改自動計算結果需要二次確認")
         self._feedback_drafts.pop(turn_id, None)
+        self.records.append((turn_id, draft[0], actual_a, actual_b))
         return feedback(turn_id, actual_a, actual_b)
+
+    def verify_revealed(self, msg: dict) -> dict | None:
+        """C14：本地重算 REVEALED，不盲信 server 的 verdict。
+
+        非自己玩家的揭示回傳 None；自己的揭示回傳本地判定、server 判定
+        以及兩者是否一致。
+        """
+        revealed_player = msg.get("player_id", msg.get("player"))
+        if self.player_id is not None and revealed_player != self.player_id:
+            return None
+        if self.commit is None:
+            raise ValueError("尚未建立 COMMIT，無法驗證揭示")
+
+        secret = msg.get("secret")
+        salt = msg.get("salt")
+        local_verdict, local_bad_turns = verify_reveal(
+            self.commit, self.records, secret, salt
+        )
+        server_verdict = msg.get("verdict")
+        server_bad_turns = msg.get("bad_turns", [])
+        return {
+            "player": revealed_player,
+            "local_verdict": local_verdict,
+            "local_bad_turns": local_bad_turns,
+            "server_verdict": server_verdict,
+            "server_bad_turns": server_bad_turns,
+            "consistent": (
+                local_verdict == server_verdict
+                and local_bad_turns == server_bad_turns
+            ),
+        }
 
 
 class ClientDisplay:
