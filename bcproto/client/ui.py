@@ -31,3 +31,11 @@ class AsyncInput:
         if timeout is not None:
             return await asyncio.wait_for(self.queue.get(), timeout=timeout)
         return await self.queue.get()
+
+
+async def confirm_feedback(input_reader: AsyncInput, turn_id: int, guess: str,
+                           draft: dict) -> bool:
+    """顯示預填回報，要求玩家確認後才送出。"""
+    print(f"回合 {turn_id}，對方喊數 {guess}，預填回報 {draft['a']}A{draft['b']}B")
+    answer = (await input_reader.get_line()).strip().lower()
+    return answer in {"y", "yes", "是", "確認"}
