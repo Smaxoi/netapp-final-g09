@@ -129,6 +129,8 @@ class ClientDisplay:
         self.reveals: list[dict] = []
         self.ranking: list[dict] = []
         self.events: list[str] = []
+        self.closed = False
+        self.close_reason: str | None = None
 
     def handle(self, msg: dict) -> None:
         """接收一則 server 訊息並更新畫面狀態。"""
@@ -173,6 +175,22 @@ class ClientDisplay:
             self.phase = "OVER"
             self.ranking = list(msg.get("ranking", []))
             self.events.append(f"遊戲結束：{msg.get('reason')}")
+        elif kind == "ERROR":
+            code = msg.get("code", "UNKNOWN")
+            message = msg.get("message", "伺服器回報錯誤")
+            self.events.append(f"伺服器錯誤 [{code}]：{message}")
+            if msg.get("fatal"):
+                self.closed = True
+                self.close_reason = f"伺服器致命錯誤 [{code}]：{message}"
+                self.phase = "CLOSED"
+
+    def connection_lost(self, error: BaseException | None = None) -> None:
+        """C15：連線中斷時保存清楚的結束原因。"""
+        self.closed = True
+        self.phase = "CLOSED"
+        detail = str(error).strip() if error else "伺服器已關閉連線"
+        self.close_reason = f"連線已中斷：{detail}"
+        self.events.append(self.close_reason)
 
     @staticmethod
     def _format_results(results: list[dict]) -> str:
@@ -184,6 +202,8 @@ class ClientDisplay:
     def render(self) -> str:
         """回傳可直接印到終端機的完整資訊摘要。"""
         lines = [f"階段：{self.phase}"]
+        if self.close_reason:
+            lines.append(self.close_reason)
         if self.lobby_players:
             lines.append("大廳玩家：" + ", ".join(
                 p.get("id", str(p)) if isinstance(p, dict) else str(p)
