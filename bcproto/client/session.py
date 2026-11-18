@@ -3,10 +3,49 @@
 from __future__ import annotations
 
 import secrets
+import json
+import os
+import time
+import uuid
 
 from ..messages import commit, feedback, reveal
 from ..rules import make_commit, score, verify_reveal
 from ..validators import valid_feedback, valid_number
+
+
+class ClientJSONLLogger:
+    """C16：寫入 client 專用目錄的 JSON Lines 日誌。"""
+
+    def __init__(self, log_dir: str = "client-logs", peer: str = "server"):
+        self.log_dir = os.fspath(log_dir)
+        if os.path.abspath(self.log_dir) == os.path.abspath("logs"):
+            raise ValueError("客戶端日誌不得寫入 server 的 logs 目錄")
+        self.peer = peer
+        os.makedirs(self.log_dir, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        self.path = os.path.join(self.log_dir, f"{stamp}-{uuid.uuid4().hex[:12]}.jsonl")
+        self.file = open(self.path, "w", encoding="utf-8")
+
+    def log(self, direction: str, msg: dict, peer: str | None = None) -> None:
+        if direction not in {"send", "recv"}:
+            raise ValueError("direction 必須是 send 或 recv")
+        record = {"ts": round(time.time(), 3), "dir": direction,
+                  "peer": peer or self.peer, "msg": msg}
+        self.file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self.file.flush()
+
+    def log_raw(self, direction: str, text: str, peer: str | None = None) -> None:
+        self.log(direction, {"raw": text}, peer)
+
+    def close(self) -> None:
+        if not self.file.closed:
+            self.file.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
 
 
 class ClientSession:

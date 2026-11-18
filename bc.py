@@ -79,6 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
         participant.add_argument("--port", type=_port, default=5040)
         participant.add_argument("--name", type=_text, required=True)
         participant.add_argument("--team", type=_text, default="G00")
+        participant.add_argument("--client-log-dir", default="client-logs")
         if command == "ai":
             participant.add_argument("--quiet", action="store_true")
     return parser
