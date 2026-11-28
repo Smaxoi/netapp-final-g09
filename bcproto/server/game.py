@@ -20,6 +20,8 @@ import asyncio
 import json
 import os
 import random
+import sys
+import threading
 import time
 import uuid
 
@@ -521,3 +523,177 @@ class GameMixin:
             self.games_played += 1
             self.close_all_conns()
             self.close_log()
+
+    # ==================================================================
+    # B18：行程生命週期（§5.3-6、§5.3-7、§5.3-8）
+    # ==================================================================
+
+    async def serve(self) -> None:
+        """開埠、連續主持 `--games` 局，然後讓行程自行結束。
+
+        規範點名的三件事都在這裡：
+
+        * **`SO_REUSEADDR`**（§5.3-7）。自我測試會連續開關同一個埠，不設這個
+          選項會卡在前一次的 TIME_WAIT 而 bind 失敗。
+        * **`--games` 迴圈**（§5.3-6）。`0` 表示不限；做完指定局數就回傳，
+          監聽埠與主控台執行緒都不留，行程自行結束。
+        * **主控台只在真的終端機才讀**（§5.3-8）。stdin 是 `/dev/null`、`NUL`、
+          管線或已關閉時完全不讀，伺服器照樣正常運作。
+
+        局與局之間監聽埠一直開著，所以上一局結束後連進來的人會留在大廳等
+        下一局。`run_game()` 自己會在 `finally` 裡關掉本局所有連線並遞增
+        `games_played`，這裡只負責「開場前清乾淨、散場後收乾淨」。
+        """
+        if self.a.bots:
+            self._say("warning: --bots 尚未實作（B17），不會啟動 AI 子行程",
+                      stream=sys.stderr)
+
+        loop = asyncio.get_running_loop()
+        # reuse_address 就是 SO_REUSEADDR；asyncio 在 POSIX 預設開啟、
+        # Windows 預設關閉，所以明確指定，三種作業系統行為才一致。
+        server = await asyncio.start_server(
+            self.handle_conn, self.a.host, self.a.port, reuse_address=True)
+
+        bound = ", ".join(self._socket_names(server))
+        games = "不限" if self.a.games == 0 else str(self.a.games)
+        self._say(f"BC/1.0 server 監聽 {bound}；--players {self.a.players}、--games {games}")
+        if self._stdin_is_console():
+            self._say("主控台：輸入 start 可在 2 人以上時提早開局")
+            threading.Thread(target=self._console_loop, args=(loop,),
+                             daemon=True, name="bc-console").start()
+
+        try:
+            while self.a.games == 0 or self.games_played < self.a.games:
+                self.reset_for_new_game()
+                await self.run_game()
+                self._say(f"第 {self.games_played} 局結束（game_id={self.game_id}）")
+        finally:
+            server.close()
+            await server.wait_closed()
+            self.close_all_conns()
+            self.close_log()
+
+    # ------------------------------------------------------------------
+    # 主控台（§5.3-8）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _stdin_is_console() -> bool:
+        """stdin 是不是真的終端機。
+
+        POSIX 上 `isatty()` 就夠了。Windows 不行：`NUL` 也是字元裝置，
+        `isatty()` 對它一樣回 True，所以 `stdin=DEVNULL` 啟動的伺服器會被
+        誤判成有主控台。只有真的 console 才拿得到 console mode，用這個補判。
+        """
+        stdin = sys.stdin
+        if stdin is None:
+            return False
+        try:
+            if not stdin.isatty():
+                return False
+            fd = stdin.fileno()
+        except (OSError, ValueError):
+            return False
+        if os.name != "nt":
+            return True
+        try:
+            import ctypes
+            import msvcrt
+
+            mode = ctypes.c_ulong()
+            handle = msvcrt.get_osfhandle(fd)
+            return bool(ctypes.windll.kernel32.GetConsoleMode(handle, ctypes.byref(mode)))
+        except (OSError, ValueError, AttributeError, ImportError):
+            return False
+
+    def _console_loop(self, loop) -> None:
+        """在獨立的 daemon 執行緒裡讀主控台命令（§5.3-8）。
+
+        不用 `loop.run_in_executor()`：`asyncio.run()` 收尾時會 join 預設執行緒
+        池，而 `readline()` 會一直卡著等按鍵，行程就永遠不會結束——正好違反
+        §5.3-6 的「主持完指定局數後行程必須自行結束」。daemon 執行緒不會被
+        join，所以該結束的時候結束得掉。
+
+        迴圈在 EOF 自然結束（`for line in sys.stdin`）。
+        """
+        try:
+            for line in sys.stdin:
+                command = line.strip().lower()
+                if command == "start":
+                    loop.call_soon_threadsafe(self._request_start)
+                elif command:
+                    self._say(f"未知的主控台命令：{command!r}（只支援 start）",
+                              stream=sys.stderr)
+        except (OSError, ValueError):
+            # stdin 中途被關掉：不讀就是了，不能影響對局。
+            pass
+
+    def _request_start(self) -> None:
+        """主控台的 `start`：在事件迴圈裡改欄位，然後敲鐘。
+
+        `lobby_phase()` 的 `ready()` 讀 `manual_start`，所以這裡一定要
+        `changed.set()`，否則大廳會繼續睡到有人加入才醒。
+        """
+        self.manual_start = True
+        self.changed.set()
+
+    # ------------------------------------------------------------------
+    # 局與局之間
+    # ------------------------------------------------------------------
+
+    def reset_for_new_game(self) -> None:
+        """清掉上一局的狀態，讓大廳重新開放（§5.3-6）。
+
+        只在 `run_game()` 之前呼叫，中間沒有 await，所以不會清掉兩局之間
+        剛連進來的人：那時還沒有人能完成 `HELLO`。連線本身不清空，只丟掉
+        已關閉的——監聽埠一直開著，新連線要留給下一局。
+        """
+        self.phase = "LOBBY"
+        self.turn_id = 0
+        self.guesser = None
+        self.guess_open = False
+        self.cur_guess = None
+        self.fb_open = False
+        self.responders = []
+        self.feedback = {}
+        self.reveal_wait = set()
+        self.players = {}
+        self.next_id = 1
+        self.manual_start = False
+        self.game_id = None
+        self.conns = {conn for conn in self.conns if not conn.closed}
+        self.changed.set()
+
+    # ------------------------------------------------------------------
+    # 給莊家看的輸出
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _say(text: str, *, stream=None) -> None:
+        """印一行給莊家看的訊息，絕不讓它弄掉伺服器。
+
+        Windows 把 stdout 導向檔案或管線時用的是系統 ANSI 編碼（這台機器是
+        cp932），中文可能編不出來而拋 `UnicodeEncodeError`。伺服器不能因為
+        一行提示字就當掉（§5.3-1），所以編不出來就退回 ASCII 轉義。
+        """
+        if stream is None:
+            stream = sys.stdout
+        try:
+            print(text, file=stream, flush=True)
+        except UnicodeEncodeError:
+            print(text.encode("ascii", "backslashreplace").decode("ascii"),
+                  file=stream, flush=True)
+        except (OSError, ValueError):
+            pass            # stdout 被關掉也不該影響對局
+
+    @staticmethod
+    def _socket_names(server) -> list:
+        """監聽中的位址，純粹為了印出來給莊家看。"""
+        names = []
+        for sock in server.sockets or ():
+            try:
+                host, port = sock.getsockname()[:2]
+            except OSError:          # pragma: no cover - 極少見
+                continue
+            names.append(f"[{host}]:{port}" if ":" in str(host) else f"{host}:{port}")
+        return names or ["?"]
